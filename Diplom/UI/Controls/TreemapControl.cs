@@ -1,30 +1,259 @@
 ﻿using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 using Diplom.Core.Models;
+using System.Linq;
 
 namespace Diplom.UI.Controls
 {
     public class TreemapControl : Control
     {
-        private List<RectItem> _items = new();
-        private ToolTip _toolTip;
+        private List<TreemapRect> _rects = new();
         private FileNode? _rootNode;
+        private ToolTip _toolTip;
+
+        private const long MinFileSizeToRender = 50 * 1024 * 1024;
 
         public TreemapControl()
         {
             this.DoubleBuffered = true;
-            this.SetStyle(ControlStyles.ResizeRedraw | ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            this.SetStyle(ControlStyles.ResizeRedraw, true);
+            this.SetStyle(ControlStyles.UserPaint, true);
+            this.SetStyle(ControlStyles.AllPaintingInWmPaint, true);
+            this.SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
 
             _toolTip = new ToolTip();
-            this.MouseMove += TreemapControl_MouseMove;
+            _toolTip.InitialDelay = 100;
+            _toolTip.ReshowDelay = 50;
         }
 
-        private void TreemapControl_MouseMove(object? sender, MouseEventArgs e)
+        public void Render(FileNode root)
         {
-            var hit = GetItemAt(e.X, e.Y);
+            _rootNode = root;
+            _rects.Clear();
+
+            if (root == null || root.TotalSize == 0)
+            {
+                this.Invalidate();
+                return;
+            }
+
+            // 1. Собираем ВСЕ файлы
+            var allFiles = new List<FileNode>();
+            CollectAllFiles(root, allFiles);
+
+            // 2. Фильтруем: оставляем только крупные файлы (> 50 МБ)
+            var filesToRender = allFiles.Where(f => f.Size >= MinFileSizeToRender).ToList();
+
+            if (filesToRender.Count < 20)
+            {
+                filesToRender = allFiles.OrderByDescending(f => f.Size).Take(100).ToList();
+            }
+
+            // 4. Сортировка по убыванию 
+            filesToRender.Sort((a, b) => b.Size.CompareTo(a.Size));
+
+            if (filesToRender.Count > 0)
+            {
+                var bounds = new RectangleF(0, 0, this.Width, this.Height);
+
+                SplitRecursive(filesToRender, 0, filesToRender.Count, bounds, true);
+            }
+
+            this.Invalidate();
+        }
+
+        public void Clear()
+        {
+            _rootNode = null;
+            _rects.Clear();
+            _toolTip.SetToolTip(this, "");
+            this.Invalidate();
+        }
+
+        #region Logic: Binary Split Algorithm (Гарантированно без полосок)
+
+        private void CollectAllFiles(FileNode node, List<FileNode> list)
+        {
+            if (!node.IsDirectory)
+            {
+                list.Add(node);
+                return;
+            }
+            foreach (var child in node.Children)
+            {
+                CollectAllFiles(child, list);
+            }
+        }
+
+        /// <summary>
+        /// Рекурсивно делит список файлов и область пополам.
+        /// </summary>
+        private void SplitRecursive(List<FileNode> nodes, int start, int count, RectangleF bounds, bool splitVertical)
+        {
+            if (count <= 0 || bounds.Width <= 0 || bounds.Height <= 0) return;
+
+            // Если остался один файл - рисуем его на всю доступную область
+            if (count == 1)
+            {
+                var node = nodes[start];
+                AddRect(node, bounds);
+                return;
+            }
+
+            // Считаем общий размер текущей группы файлов
+            long totalSize = 0;
+            for (int i = start; i < start + count; i++) totalSize += nodes[i].Size;
+
+            if (totalSize == 0) return;
+
+            // Ищем точку раздела, чтобы суммы размеров слева и справа были примерно равны
+            long currentSize = 0;
+            long halfSize = totalSize / 2;
+            int splitIndex = start;
+
+            for (int i = start; i < start + count; i++)
+            {
+                currentSize += nodes[i].Size;
+                if (currentSize >= halfSize)
+                {
+                    splitIndex = i;
+                    break;
+                }
+            }
+
+            // Защита от зацикливания 
+            if (splitIndex == start + count - 1 && count > 2)
+            {
+                splitIndex = start + count / 2;
+            }
+
+            int count1 = splitIndex - start + 1;
+            int count2 = count - count1;
+
+            if (count1 <= 0 || count2 <= 0) return;
+
+            // Считаем размер первой части для пропорционального деления области
+            long size1 = 0;
+            for (int i = start; i < start + count1; i++) size1 += nodes[i].Size;
+
+            double ratio = (double)size1 / totalSize;
+
+            RectangleF rect1, rect2;
+
+            if (splitVertical)
+            {
+                // Делим по вертикали (левая и правая часть)
+                float w = (float)(bounds.Width * ratio);
+                rect1 = new RectangleF(bounds.X, bounds.Y, w, bounds.Height);
+                rect2 = new RectangleF(bounds.X + w, bounds.Y, bounds.Width - w, bounds.Height);
+            }
+            else
+            {
+                // Делим по горизонтали (верхняя и нижняя часть)
+                float h = (float)(bounds.Height * ratio);
+                rect1 = new RectangleF(bounds.X, bounds.Y, bounds.Width, h);
+                rect2 = new RectangleF(bounds.X, bounds.Y + h, bounds.Width, bounds.Height - h);
+            }
+
+            // Рекурсивный вызов для частей с чередованием направления разреза
+            SplitRecursive(nodes, start, count1, rect1, !splitVertical);
+            SplitRecursive(nodes, splitIndex + 1, count2, rect2, !splitVertical);
+        }
+
+        private void AddRect(FileNode node, RectangleF bounds)
+        {
+            if (bounds.Width < 1 || bounds.Height < 1) return;
+
+            var rect = Rectangle.Round(bounds);
+            if (rect.Width > 0 && rect.Height > 0)
+            {
+                _rects.Add(new TreemapRect
+                {
+                    Node = node,
+                    Rectangle = rect,
+                    Color = GetColorForSize(node.Size)
+                });
+            }
+        }
+
+        #endregion
+
+        #region Rendering
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+
+            if (_rects.Count == 0)
+            {
+                using var bgBrush = new SolidBrush(Color.FromArgb(245, 245, 245));
+                e.Graphics.FillRectangle(bgBrush, ClientRectangle);
+
+                string msg = _rootNode == null ? "Нажмите 'Сканировать диски'" : "Нет файлов для отображения";
+                using var font = new Font("Segoe UI", 12f, FontStyle.Bold);
+                using var textBrush = new SolidBrush(Color.Gray);
+                var size = e.Graphics.MeasureString(msg, font);
+                e.Graphics.DrawString(msg, font, textBrush, (Width - size.Width) / 2, (Height - size.Height) / 2);
+                return;
+            }
+
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+            // Белые границы чуть толще для красоты
+            using var borderPen = new Pen(Color.White, 2f);
+
+            using var nameFont = new Font("Segoe UI", 9f, FontStyle.Bold); // Шрифт чуть крупнее
+            using var shadowFont = new Font("Segoe UI", 9f, FontStyle.Bold);
+
+            foreach (var tr in _rects)
+            {
+                // Заливка
+                using (var fillBrush = new SolidBrush(tr.Color))
+                {
+                    g.FillRectangle(fillBrush, tr.Rectangle);
+                }
+
+                // Граница
+                g.DrawRectangle(borderPen, tr.Rectangle);
+
+                // Текст
+                if (tr.Rectangle.Width > 30 && tr.Rectangle.Height > 20)
+                {
+                    string fileName = tr.Node.Name;
+                    if (fileName.Length > 18) fileName = fileName.Substring(0, 15) + "...";
+
+                    // Тень
+                    using (var shadowBrush = new SolidBrush(Color.FromArgb(80, 0, 0, 0)))
+                    {
+                        g.DrawString(fileName, shadowFont, shadowBrush, tr.Rectangle.X + 2, tr.Rectangle.Y + 2);
+                    }
+
+                    // Текст
+                    using (var textBrush = new SolidBrush(Color.White))
+                    {
+                        g.DrawString(fileName, nameFont, textBrush, tr.Rectangle.X + 1, tr.Rectangle.Y + 1);
+                    }
+                }
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            var hit = _rects.FirstOrDefault(r => r.Rectangle.Contains(e.Location));
+
             if (hit != null)
             {
-                _toolTip.SetToolTip(this, $"{hit.Name}\nРазмер: {FormatSize(hit.Size)}");
+                string sizeStr = FormatSize(hit.Node.Size);
+                string tooltip = $"Файл: {hit.Node.Name}\nПуть: {hit.Node.Path}\nРазмер: {sizeStr}";
+
+                if (_toolTip.GetToolTip(this) != tooltip)
+                {
+                    _toolTip.SetToolTip(this, tooltip);
+                }
                 this.Cursor = Cursors.Hand;
             }
             else
@@ -34,219 +263,27 @@ namespace Diplom.UI.Controls
             }
         }
 
-        public void Clear()
+        #endregion
+
+        #region Helpers
+
+        private Color GetColorForSize(long sizeBytes)
         {
-            _items.Clear();
-            _rootNode = null;
-            this.Invalidate();
-        }
+            long GB = 1024L * 1024 * 1024;
+            long MB = 1024L * 1024;
 
-        public void Render(FileNode root)
-        {
-            _rootNode = root;
-            _items.Clear();
-
-            if (root == null) return;
-
-            // 1. Собираем ВСЕ файлы из дерева в плоский список
-            var allFiles = new List<FileNode>();
-            CollectAllFiles(root, allFiles);
-
-            if (allFiles.Count == 0) return;
-
-            // 2. Сортируем по убыванию размера
-            allFiles.Sort((a, b) => b.Size.CompareTo(a.Size));
-
-            // 3. Оптимизация отрисовки:
-            // Если файлов слишком много (> 2000), мелкие файлы мы не рисуем по отдельности,
-            // а суммируем их в один блок "Прочее", иначе прямоугольники будут размером в 1 пиксель.
-            long drawnSize = 0;
-            long totalSize = allFiles.Sum(f => f.Size);
-            var filesToDraw = new List<FileNode>();
-            long otherSize = 0;
-
-            int maxItems = Math.Min(allFiles.Count, 1000); // Рисуем топ-1000 файлов
-
-            for (int i = 0; i < allFiles.Count; i++)
-            {
-                if (i < maxItems)
-                {
-                    filesToDraw.Add(allFiles[i]);
-                    drawnSize += allFiles[i].Size;
-                }
-                else
-                {
-                    otherSize += allFiles[i].Size;
-                }
-            }
-
-            if (otherSize > 0)
-            {
-                filesToDraw.Add(new FileNode
-                {
-                    Name = $"Прочие файлы ({allFiles.Count - maxItems} шт.)",
-                    Size = otherSize,
-                    IsDirectory = false,
-                    Path = ""
-                });
-            }
-
-            // 4. Запускаем алгоритм Squarified Treemap
-            var rect = new RectangleF(0, 0, this.Width, this.Height);
-            Squarify(filesToDraw, rect, _items);
-
-            this.Invalidate();
-        }
-
-        private void CollectAllFiles(FileNode node, List<FileNode> list)
-        {
-            if (!node.IsDirectory)
-            {
-                list.Add(node);
-                return;
-            }
-
-            foreach (var child in node.Children)
-            {
-                CollectAllFiles(child, list);
-            }
-        }
-
-        // Алгоритм Squarified Treemap
-        private void Squarify(List<FileNode> nodes, RectangleF targetRect, List<RectItem> result)
-        {
-            if (nodes.Count == 0) return;
-
-            double totalSize = nodes.Sum(n => n.Size);
-            if (totalSize <= 0) return;
-
-            double aspectRatio = targetRect.Width / targetRect.Height;
-
-            // Рекурсивное разбиение
-            LayoutRow(nodes, targetRect, result, aspectRatio);
-        }
-
-        private void LayoutRow(List<FileNode> nodes, RectangleF rect, List<RectItem> result, double aspectRatio)
-        {
-            if (nodes.Count == 0) return;
-
-            // Пытаемся разместить все узлы в текущем ряду
-            // Упрощенная реализация для вертикального/горизонтального деления
-
-            double currentSize = 0;
-            int splitIndex = 0;
-
-            // Эвристика: делим список пополам или ищем точку разрыва по соотношению сторон
-            // Для простоты и скорости используем рекурсивное деление пополам (Binary Split), 
-            // что дает хороший результат для больших списков и работает быстрее классического Squarify
-
-            if (nodes.Count == 1)
-            {
-                result.Add(new RectItem(rect, nodes[0]));
-                return;
-            }
-
-            // Делим список на две части примерно равные по площади
-            long total = nodes.Sum(n => n.Size);
-            long half = total / 2;
-            long currentSum = 0;
-
-            for (int i = 0; i < nodes.Count; i++)
-            {
-                currentSum += nodes[i].Size;
-                if (currentSum >= half)
-                {
-                    splitIndex = i + 1;
-                    break;
-                }
-            }
-            if (splitIndex == 0) splitIndex = nodes.Count / 2;
-            if (splitIndex >= nodes.Count) splitIndex = nodes.Count - 1;
-
-            var leftNodes = nodes.GetRange(0, splitIndex);
-            var rightNodes = nodes.GetRange(splitIndex, nodes.Count - splitIndex);
-
-            double leftSize = leftNodes.Sum(n => n.Size);
-            double rightSize = rightNodes.Sum(n => n.Size);
-
-            double ratio = leftSize / (leftSize + rightSize);
-
-            RectangleF rect1, rect2;
-
-            if (rect.Width > rect.Height)
-            {
-                // Делим по вертикали
-                float w = (float)(rect.Width * ratio);
-                rect1 = new RectangleF(rect.X, rect.Y, w, rect.Height);
-                rect2 = new RectangleF(rect.X + w, rect.Y, rect.Width - w, rect.Height);
-            }
-            else
-            {
-                // Делим по горизонтали
-                float h = (float)(rect.Height * ratio);
-                rect1 = new RectangleF(rect.X, rect.Y, rect.Width, h);
-                rect2 = new RectangleF(rect.X, rect.Y + h, rect.Width, rect.Height - h);
-            }
-
-            LayoutRow(leftNodes, rect1, result, aspectRatio);
-            LayoutRow(rightNodes, rect2, result, aspectRatio);
-        }
-
-        private RectItem? GetItemAt(int x, int y)
-        {
-            foreach (var item in _items)
-            {
-                if (item.Rectangle.Contains(x, y)) return item;
-            }
-            return null;
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            base.OnPaint(e);
-            var g = e.Graphics;
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            g.Clear(Color.FromArgb(240, 240, 240));
-
-            using var font = new Font("Segoe UI", 8f, FontStyle.Bold);
-            using var textBrush = new SolidBrush(Color.Black);
-            using var borderPen = new Pen(Color.White, 1f);
-
-            foreach (var item in _items)
-            {
-                if (item.Rectangle.Width < 2 || item.Rectangle.Height < 2) continue;
-
-                // Цвет зависит от размера (градиент от синего к красному) или типа
-                Color color = GetColorForSize(item.Size);
-
-                using (var brush = new SolidBrush(color))
-                {
-                    g.FillRectangle(brush, item.Rectangle);
-                }
-
-                g.DrawRectangle(borderPen,
-                    item.Rectangle.X, item.Rectangle.Y,
-                    item.Rectangle.Width - 1, item.Rectangle.Height - 1);
-
-                // Текст, если влезает
-                if (item.Rectangle.Width > 30 && item.Rectangle.Height > 20)
-                {
-                    string text = item.Name.Length > 15 ? item.Name.Substring(0, 12) + "..." : item.Name;
-                    // Простая обрезка текста по ширине не реализована для краткости, но база есть
-                    g.DrawString(text, font, textBrush, item.Rectangle.X + 2, item.Rectangle.Y + 2);
-                }
-            }
-        }
-
-        private Color GetColorForSize(long size)
-        {
-            // Логика цветов: большие файлы - красные, средние - желтые, мелкие - зеленые/синие
-            if (size > 500 * 1024 * 1024) return Color.FromArgb(200, 50, 50); // > 500MB (Красный)
-            if (size > 100 * 1024 * 1024) return Color.FromArgb(200, 100, 50); // > 100MB (Оранжевый)
-            if (size > 50 * 1024 * 1024) return Color.FromArgb(200, 150, 50);  // > 50MB (Желтый)
-            if (size > 10 * 1024 * 1024) return Color.FromArgb(50, 150, 50);   // > 10MB (Зеленый)
-            if (size > 1 * 1024 * 1024) return Color.FromArgb(50, 100, 200);   // > 1MB (Синий)
-            return Color.FromArgb(150, 150, 150); // Мелкие (Серый)
+            if (sizeBytes < 100 * MB) return Color.FromArgb(173, 216, 230); // LightBlue
+            if (sizeBytes < 500 * MB) return Color.FromArgb(32, 178, 170);  // LightSeaGreen
+            if (sizeBytes < 1 * GB) return Color.FromArgb(46, 139, 87);     // SeaGreen
+            if (sizeBytes < 2 * GB) return Color.FromArgb(124, 252, 0);     // LawnGreen
+            if (sizeBytes < 5 * GB) return Color.FromArgb(154, 205, 50);    // YellowGreen
+            if (sizeBytes < 10 * GB) return Color.FromArgb(218, 165, 32);   // GoldenRod
+            if (sizeBytes < 20 * GB) return Color.FromArgb(255, 191, 0);    // Amber
+            if (sizeBytes < 30 * GB) return Color.FromArgb(255, 165, 79);   // DarkOrange
+            if (sizeBytes < 40 * GB) return Color.FromArgb(255, 127, 80);   // Coral
+            if (sizeBytes < 50 * GB) return Color.FromArgb(255, 99, 71);    // Tomato
+            if (sizeBytes < 100 * GB) return Color.FromArgb(255, 69, 0);    // OrangeRed
+            return Color.FromArgb(139, 0, 0);                               // DarkRed
         }
 
         private string FormatSize(long bytes)
@@ -254,22 +291,21 @@ namespace Diplom.UI.Controls
             string[] sizes = { "Б", "КБ", "МБ", "ГБ", "ТБ" };
             double len = bytes;
             int order = 0;
-            while (len >= 1024 && order < sizes.Length - 1) { order++; len /= 1024; }
+            while (len >= 1024 && order < sizes.Length - 1)
+            {
+                order++;
+                len /= 1024;
+            }
             return $"{len:0.##} {sizes[order]}";
         }
 
-        private class RectItem
-        {
-            public RectangleF Rectangle { get; }
-            public FileNode Node { get; }
-            public string Name => Node.Name;
-            public long Size => Node.Size;
+        #endregion
 
-            public RectItem(RectangleF rect, FileNode node)
-            {
-                Rectangle = rect;
-                Node = node;
-            }
+        private class TreemapRect
+        {
+            public FileNode Node { get; set; } = null!;
+            public Rectangle Rectangle { get; set; }
+            public Color Color { get; set; }
         }
     }
 }

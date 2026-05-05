@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Net.NetworkInformation;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Diplom.Core.Interfaces;
@@ -10,9 +11,10 @@ namespace Diplom.Services
     {
         private readonly ILogger<SystemMetricsService> _logger;
         private readonly int _refreshRateMs;
+
+        // Счетчики CPU и RAM
         private readonly PerformanceCounter _cpuCounter;
         private readonly PerformanceCounter _ramAvailableCounter;
-        private bool _isInitialized = false;
 
         public event Action<SystemMetrics>? MetricsUpdated;
 
@@ -23,18 +25,24 @@ namespace Diplom.Services
             _logger = logger;
             _refreshRateMs = settings.Value.UiRefreshRateMs;
 
+            // Инициализация счетчиков CPU
             _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
+
+            // Инициализация счетчиков RAM
             _ramAvailableCounter = new PerformanceCounter("Memory", "Available MBytes");
+
+            _logger.LogInformation("System Metrics Service initialized.");
         }
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
             return Task.Run(async () =>
             {
-                _logger.LogInformation("Metrics Service started.");
+                _logger.LogInformation("System Metrics Service started.");
+
+                // Первый замер для прогрева счетчика CPU (иначе будет 0)
                 _cpuCounter.NextValue();
                 await Task.Delay(500, cancellationToken);
-                _isInitialized = true;
 
                 while (!cancellationToken.IsCancellationRequested)
                 {
@@ -42,12 +50,16 @@ namespace Diplom.Services
                     {
                         var metrics = CollectMetrics();
                         MetricsUpdated?.Invoke(metrics);
+
                         await Task.Delay(_refreshRateMs, cancellationToken);
                     }
-                    catch (OperationCanceledException) { break; }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Metrics error");
+                        _logger.LogError(ex, "Error collecting metrics.");
                         await Task.Delay(1000, cancellationToken);
                     }
                 }
@@ -56,17 +68,21 @@ namespace Diplom.Services
 
         private SystemMetrics CollectMetrics()
         {
+            // 1. CPU
             float cpuLoad = _cpuCounter.NextValue();
+
+            // 2. RAM
             float availableRamMB = _ramAvailableCounter.NextValue();
+
+            // Получаем общий объем ОЗУ через GC 
             long totalRamBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
             long availableRamBytes = (long)(availableRamMB * 1024 * 1024);
 
+            // Возвращаем объект ТОЛЬКО с теми полями, которые есть в SystemMetrics.cs
             return new SystemMetrics(
                 TotalCpuUsage: Math.Round(cpuLoad, 2),
                 TotalPhysicalMemory: totalRamBytes,
                 AvailablePhysicalMemory: availableRamBytes,
-                TotalPageFile: totalRamBytes,
-                AvailablePageFile: availableRamBytes,
                 Timestamp: DateTime.Now
             );
         }

@@ -10,8 +10,6 @@ namespace Diplom.Core.Models
         double TotalCpuUsage,
         long TotalPhysicalMemory,
         long AvailablePhysicalMemory,
-        long TotalPageFile,
-        long AvailablePageFile,
         DateTime Timestamp
     );
 }

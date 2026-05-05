@@ -81,10 +81,7 @@ namespace Diplom.Services
 
                         long ioRead = 0;
                         long ioWrite = 0;
-                        // IO статистика в .NET 8 через Process не всегда доступна напрямую без P/Invoke, оставляем 0 для стабильности
-                        // или используем безопасный блок, если решим добавить позже.
 
-                        // СОЗДАНИЕ ОБЪЕКТА ЧЕРЕЗ СВОЙСТВА (МАКСИМАЛЬНО НАДЕЖНО)
                         var snapshot = new ProcessSnapshot();
                         snapshot.Id = proc.Id;
                         snapshot.Name = proc.ProcessName;
@@ -157,7 +154,7 @@ namespace Diplom.Services
                     if (foundInstance != null)
                     {
                         var counter = new PerformanceCounter("Process", "% Processor Time", foundInstance, readOnly: true);
-                        counter.NextValue(); // Init
+                        counter.NextValue(); 
                         _cpuCountersCache[proc.Id] = counter;
                         return counter;
                     }

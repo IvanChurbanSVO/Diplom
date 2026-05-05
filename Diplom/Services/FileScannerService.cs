@@ -11,8 +11,10 @@ namespace Diplom.Services
         private FileNode? _lastResult;
         private readonly object _lock = new();
 
+        // Ограничение глубины: 6 уровней
+        private const int MAX_DEPTH = 6;
+
         public event Action? ScanCompleted;
-        public event Action<string>? StatusUpdated; // Событие для статуса
 
         public FileScannerService(ILogger<FileScannerService> logger)
         {
@@ -26,149 +28,143 @@ namespace Diplom.Services
 
         public Task StartScanAsync(CancellationToken cancellationToken)
         {
-            return Task.Run(async () =>
+            return Task.Run(() =>
             {
                 try
                 {
-                    StatusUpdated?.Invoke("Начало сканирования всех дисков...");
-                    _logger.LogInformation("=== НАЧАЛО ПОЛНОГО СКАНИРОВАНИЯ ===");
+                    _logger.LogInformation("Запуск сканирования...");
 
                     var root = new FileNode
                     {
-                        Name = "Все диски",
+                        Name = "Компьютер",
                         Path = "",
                         IsDirectory = true,
-                        Size = 0
+                        Level = 0
                     };
 
                     var drives = DriveInfo.GetDrives();
-                    long totalScannedSize = 0;
-                    int totalFilesCount = 0;
-
                     foreach (var drive in drives)
                     {
                         if (cancellationToken.IsCancellationRequested) return;
                         if (!drive.IsReady) continue;
 
-                        StatusUpdated?.Invoke($"Сканирование диска {drive.Name}...");
-                        _logger.LogInformation($"-> Диск {drive.Name} ({drive.DriveFormat})");
-
                         try
                         {
-                            var driveNode = await ScanDirectoryAsync(drive.RootDirectory.FullName, cancellationToken);
+                            _logger.LogInformation($"Сканирование диска {drive.Name}...");
 
-                            if (driveNode.TotalSize > 0)
+                            // Сканируем корень диска (уровень 0)
+                            var driveNode = ScanFolder(drive.RootDirectory.FullName, 0, cancellationToken);
+
+                            if (driveNode != null)
                             {
-                                driveNode.Name = $"{drive.Name} ({FormatSize(driveNode.TotalSize)})";
+                                driveNode.Name = $"{drive.Name} ({drive.DriveFormat})";
+                                driveNode.Path = drive.Name;
                                 root.Children.Add(driveNode);
-                                totalScannedSize += driveNode.TotalSize;
-                                totalFilesCount += CountFiles(driveNode);
-
-                                _logger.LogInformation($"   Диск {drive.Name} завершен. Файлов: {CountFiles(driveNode)}, Размер: {FormatSize(driveNode.TotalSize)}");
+                                root.TotalSize += driveNode.TotalSize;
+                                root.Size += driveNode.Size;
                             }
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, $"Ошибка диска {drive.Name}");
+                            _logger.LogError($"Ошибка диска {drive.Name}: {ex.Message}");
                         }
                     }
 
-                    root.Size = totalScannedSize;
-                    root.TotalSize = totalScannedSize;
+                    _logger.LogInformation($"Сканирование завершено. Найдено: {root.TotalSize / (1024 * 1024 * 1024)} ГБ");
 
                     lock (_lock)
                     {
                         _lastResult = root;
                     }
 
-                    StatusUpdated?.Invoke($"Готово! Найдено {totalFilesCount:N0} файлов на {FormatSize(totalScannedSize)}");
-                    _logger.LogInformation($"=== СКАНИРОВАНИЕ ЗАВЕРШЕНО. Всего: {FormatSize(totalScannedSize)} ===");
-
                     ScanCompleted?.Invoke();
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogWarning("Сканирование отменено.");
-                    StatusUpdated?.Invoke("Отменено пользователем.");
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogCritical(ex, "Критическая ошибка сканера.");
-                    StatusUpdated?.Invoke($"Ошибка: {ex.Message}");
+                    _logger.LogCritical($"Критическая ошибка: {ex.Message}");
                 }
             }, cancellationToken);
         }
 
-        private int CountFiles(FileNode node)
+        /// <summary>
+        /// Рекурсивный обход папок. БЕЗ лишней асинхронности внутри, чтобы не было StackOverflow.
+        /// </summary>
+        private FileNode? ScanFolder(string path, int currentDepth, CancellationToken token)
         {
-            int count = node.IsDirectory ? 0 : 1;
-            foreach (var child in node.Children) count += CountFiles(child);
-            return count;
-        }
+            if (token.IsCancellationRequested) return null;
+            if (currentDepth > MAX_DEPTH) return null; // Стоп на 6 уровне
 
-        private async Task<FileNode> ScanDirectoryAsync(string path, CancellationToken cancellationToken)
-        {
             var node = new FileNode
             {
-                Path = path,
                 Name = new DirectoryInfo(path).Name,
+                Path = path,
                 IsDirectory = true,
-                Size = 0,
-                TotalSize = 0
+                Level = currentDepth,
+                Children = new List<FileNode>()
             };
 
             try
             {
-                var dirInfo = new DirectoryInfo(path);
+                var dir = new DirectoryInfo(path);
 
-                // 1. Сначала файлы в этой папке
-                foreach (var file in dirInfo.EnumerateFiles("*", SearchOption.TopDirectoryOnly))
+                // 1. Сначала собираем файлы в ЭТОЙ папке
+                foreach (var file in dir.EnumerateFiles())
                 {
-                    if (cancellationToken.IsCancellationRequested) break;
+                    if (token.IsCancellationRequested) break;
                     try
                     {
-                        var fNode = new FileNode
+                        long size = file.Length;
+                        node.Children.Add(new FileNode
                         {
-                            Path = file.FullName,
                             Name = file.Name,
-                            Size = file.Length,
-                            TotalSize = file.Length,
-                            IsDirectory = false
-                        };
-                        node.Children.Add(fNode);
-                        node.Size += file.Length;
+                            Path = file.FullName,
+                            Size = size,
+                            TotalSize = size,
+                            IsDirectory = false,
+                            Level = currentDepth
+                        });
+                        node.Size += size;
+                        node.TotalSize += size;
                     }
-                    catch { /* Игнорируем недоступные файлы */ }
+                    catch { /* Файл занят или нет доступа - пропускаем */ }
                 }
 
-                // 2. Потом папки (рекурсия)
-                foreach (var dir in dirInfo.EnumerateDirectories("*", SearchOption.TopDirectoryOnly))
+                // 2. Если еще не достигли лимита глубины, идем в подпапки
+                if (currentDepth < MAX_DEPTH)
                 {
-                    if (cancellationToken.IsCancellationRequested) break;
-                    try
+                    foreach (var subDir in dir.EnumerateDirectories())
                     {
-                        // Асинхронная рекурсия с небольшой задержкой, чтобы UI успевал дышать
-                        var child = await ScanDirectoryAsync(dir.FullName, cancellationToken);
-                        node.Children.Add(child);
-                        node.Size += child.TotalSize;
+                        if (token.IsCancellationRequested) break;
+
+                        // Пропускаем системные ссылки, чтобы не было циклов и StackOverflow
+                        if ((subDir.Attributes & FileAttributes.ReparsePoint) != 0)
+                            continue;
+
+                        try
+                        {
+                            var childNode = ScanFolder(subDir.FullName, currentDepth + 1, token);
+                            if (childNode != null)
+                            {
+                                node.Children.Add(childNode);
+                                node.TotalSize += childNode.TotalSize;
+                            }
+                        }
+                        catch { /* Папка недоступна - пропускаем */ }
                     }
-                    catch { /* Игнорируем недоступные папки */ }
+                }
+                else
+                {
+                    _logger.LogDebug($"Достигнут лимит глубины ({MAX_DEPTH}) для: {path}");
                 }
             }
             catch (UnauthorizedAccessException) { }
             catch (IOException) { }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"Ошибка при чтении {path}: {ex.Message}");
+            }
 
-            node.TotalSize = node.Size;
             return node;
-        }
-
-        private string FormatSize(long bytes)
-        {
-            string[] sizes = { "Б", "КБ", "МБ", "ГБ", "ТБ" };
-            double len = bytes;
-            int order = 0;
-            while (len >= 1024 && order < sizes.Length - 1) { order++; len /= 1024; }
-            return $"{len:0.##} {sizes[order]}";
         }
     }
 }
